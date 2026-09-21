@@ -2,14 +2,23 @@
 
 POST /v1/systemone takes Jev's request body: {"model", "state", "questions"}.
 "questions" maps an id to {"type", "instructions", "criteria"}, where "type"
-is "noul", "choice" or "score" and the criteria shape follows the type:
+is "noul", "choice", "score", "span" or "spans" and the criteria shape
+follows the type:
   noul:   optional {"true": ..., "false": ...} descriptions
   choice: option name -> description or null
   score:  ordered list of levels
+  span:   optional {"max_tokens": n}; the answer is a piece of the text
+  spans:  optional {"max_tokens": n, "max_items": n}; every such piece
 Answers take Jev's shapes, with this server's diagnostics alongside:
   noul:   {"noul": p}
   choice: {"choice", "probabilities", "confidence"}
   score:  {"score", "legend", "probabilities", "confidence"}
+  span:   {"found", "text", "start", "end", "confidence", "coverage"}
+  spans:  {"found", "items": [{"text", "start", "end", "confidence"}]}
+A span is a substring of the state's text, by construction: the model fills
+a pinned blank by copying, only the text's own token ids are read, and the
+decode walks the text with those tokens. "start" and "end" are character
+offsets into the state when it is a string, else into its "text" field.
 The request body may also carry the schema keys "instructions", "samples",
 "auto_max", "auto_threshold", "steps", "think", "ask", "chunk_rows",
 "chunk_prompt" and "sequential" as extensions. Images go ahead of the
@@ -81,6 +90,7 @@ import json
 import math
 import os
 import random
+import re
 import ssl
 import subprocess
 import threading
@@ -107,6 +117,38 @@ TOPK = 20
 MAX_QUESTIONS = 64  # per request
 MAX_SAMPLES = 32  # reads per question, fixed or auto
 MAX_PARALLEL = 16  # question groups read at once
+SPAN_STEPS = (
+    4  # denoise steps for a span blank; one step spells it position by position
+)
+SPAN_REGION = 24  # default blank for one span, in tokens
+SPAN_LIST_REGION = 64  # default blank for a list of spans
+SPAN_ID_CAP = 128  # vLLM's logprob_token_ids cap: the text's ids must fit
+SPAN_MIN_CONF = 0.3  # below this a span read is repeated with the next seed
+SPAN_MAX_READS = 3
+SPAN_PASSES = 2  # list reads per window, merged by offset
+SPAN_FLOOR = -30.0
+SPAN_BOUNDARY = set(" \t\n,;:.!?()[]{}\"'#$")
+EOS = 1
+NL = None
+SPAN_SYSTEM = (
+    "Answer with the exact value copied from the text, character for character, "
+    "or none if the text has no such value.{context}\n\nQuestion answer: {q}\n"
+    "  (the value only)\n\n"
+    'Reply with one line per question, in this order, formatted as "id: label".'
+)
+SPAN_LIST_SYSTEM = (
+    "List every value of the requested kind found in the text, one per line, "
+    "each copied exactly as it appears, character for character, in the order "
+    "they appear. Write none if there is none.{context}\n\nQuestion answer: {q}\n"
+    "  (one value per line)\n\n"
+    'Reply with the answer lines, formatted as "id: value".'
+)
+SPAN_CHOOSE_SYSTEM = (
+    "Several candidate answers were copied from the text. Choose the one that "
+    "is exactly the right answer, no more and no less.{context}\n\n"
+    "Question answer: {q}\nCandidates:\n{options}\n\n"
+    'Reply with one line, formatted as "id: label".'
+)
 # the empty thought block the chat template leaves to the model
 SCAFFOLD_TEXT = "<|channel>thought\n<channel|>"
 SCAFFOLD = None
@@ -165,9 +207,20 @@ def parse_schema(value):
                 if len(choices) <= 9
                 else [chr(ord("A") + i) for i in range(len(choices))]
             )
+        elif kind in ("span", "spans"):
+            default = SPAN_REGION if kind == "span" else SPAN_LIST_REGION
+            span_cfg = {
+                "max_tokens": q.get("max_tokens", default),
+                "max_items": q.get("max_items", 16),
+            }
+            for key, hi in (("max_tokens", 96), ("max_items", 64)):
+                v = span_cfg[key]
+                if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= hi:
+                    raise SchemaError(f"question {qid!r}: {key} must be 1 to {hi}")
+            choices, labels = [], []
         else:
             raise SchemaError(f"question {qid!r}: unknown type {kind!r}")
-        if len(choices) < 2:
+        if kind not in ("span", "spans") and len(choices) < 2:
             raise SchemaError(f"question {qid!r}: needs at least two alternatives")
         if len(choices) > 26:
             raise SchemaError(f"question {qid!r}: at most 26 alternatives")
@@ -184,6 +237,10 @@ def parse_schema(value):
                 f"question {qid!r}: ask_if must map a question id to a "
                 "non-empty list of its answers"
             )
+        if kind in ("span", "spans") and (deps or ask_if):
+            raise SchemaError(
+                f"question {qid!r}: a span question cannot depend on another question"
+            )
         qs.append(
             {
                 "id": qid,
@@ -194,6 +251,7 @@ def parse_schema(value):
                 "depends_on": list(dict.fromkeys(list(deps) + list(ask_if))),
                 "ask_if": ask_if,
                 "alone": bool(q.get("alone", False)),
+                "span": span_cfg if kind in ("span", "spans") else None,
             }
         )
     by_id = {q["id"]: q for q in qs}
@@ -202,6 +260,10 @@ def parse_schema(value):
             if dep not in by_id or dep == q["id"]:
                 raise SchemaError(
                     f"question {q['id']!r}: depends on unknown question {dep!r}"
+                )
+            if by_id[dep]["span"]:
+                raise SchemaError(
+                    f"question {q['id']!r}: cannot depend on the span question {dep!r}"
                 )
         for dep, vals in q["ask_if"].items():
             names = [c[0] for c in by_id[dep]["choices"]]
@@ -251,7 +313,7 @@ def parse_schema(value):
         "chunk_rows": chunk_rows,
         "chunk_prompt": chunk_prompt,
         "sequential": sequential,
-        "format": "lines" if len(qs) <= 10 else "indexed",
+        "format": "lines" if len([q for q in qs if not q["span"]]) <= 10 else "indexed",
     }
 
 
@@ -316,8 +378,11 @@ def enc(text):
 
 
 def init_tokenizer(tok):
-    global TOK, SCAFFOLD, THOUGHT_OPEN, THOUGHT_CLOSE
+    global TOK, SCAFFOLD, THOUGHT_OPEN, THOUGHT_CLOSE, EOS, NL
     TOK = tok
+    if tok.eos_token_id is not None:
+        EOS = int(tok.eos_token_id)
+    NL = enc("\n")[0]
     THOUGHT_OPEN = enc("<|channel>thought\n")
     THOUGHT_CLOSE = enc("<channel|>")
     SCAFFOLD = enc(SCAFFOLD_TEXT)
@@ -726,6 +791,33 @@ def decide(schema, state_content, seed):
         for q in schema["questions"]
         if not schema.get("ask") or q["id"] in schema["ask"]
     ]
+    span_qs = [q for q in qs if q["span"]]
+    qs = [q for q in qs if not q["span"]]
+    # Span questions are reads of their own, run beside the label reads.
+    span_pool = ThreadPoolExecutor(max_workers=1) if span_qs else None
+    span_future = (
+        span_pool.submit(decide_spans, schema, span_qs, state_content, seed)
+        if span_qs
+        else None
+    )
+    schema = dict(schema, questions=[q for q in schema["questions"] if not q["span"]])
+    if not qs:
+        span_answers, span_diag = span_future.result()
+        span_pool.shutdown(wait=False)
+        diagnostics = {
+            "steps": schema["steps"],
+            "stages": [],
+            "skipped": {},
+            "chunks": [],
+            "spans": span_diag,
+            "timing": {
+                "total_ms": (time.time() - started) * 1e3,
+                "reads": span_diag["reads"],
+            },
+            "questions": {},
+            "engine": "vllm",
+        }
+        return {"answers": span_answers, "diagnostics": diagnostics}, span_diag["rows"]
     levels = schedule(qs)
     text_state = isinstance(state_content, str)
     fmt = schema["format"]
@@ -890,9 +982,503 @@ def decide(schema, state_content, seed):
         "questions": diag_q,
         "engine": "vllm",
     }
-    return {"answers": answers, "diagnostics": diagnostics}, sum(
-        rows for _, rows in parts
-    ) + extra_rows
+    total_rows = sum(rows for _, rows in parts) + extra_rows
+    if span_future is not None:
+        try:
+            span_answers, span_diag = span_future.result()
+        finally:
+            span_pool.shutdown(wait=False)
+        answers.update(span_answers)
+        diagnostics["spans"] = span_diag
+        diagnostics["timing"]["reads"] += span_diag["reads"]
+        diagnostics["timing"]["total_ms"] = (time.time() - started) * 1e3
+        total_rows += span_diag["rows"]
+    order = [q["id"] for q in qs] + [q["id"] for q in span_qs]
+    answers = {qid: answers.get(qid) for qid in order}
+    return {"answers": answers, "diagnostics": diagnostics}, total_rows
+
+
+# ----------------------------------------------------------------------------
+# Spans
+# ----------------------------------------------------------------------------
+
+
+def span_source(state_content):
+    """The text a span's offsets refer to: the state when it is a string,
+    else the text part of an image state. A JSON state is grounded as the
+    JSON the model reads."""
+    if isinstance(state_content, str):
+        return state_content
+    return next((p["text"] for p in state_content if p.get("type") == "text"), "")
+
+
+_piece_cache = {}
+_piece_lock = threading.Lock()
+
+
+def span_pieces(text):
+    """id -> the string that token contributes: every token of the text in
+    both spacings, plus each word's own first token with and without a
+    leading space, since the model opens a value like "A-1042" with " A"
+    while the text only holds "#A"."""
+    with _piece_lock:
+        if text in _piece_cache:
+            return _piece_cache[text]
+    variants = [" " + text, text]
+    for w in set(text.split()):
+        variants += [" " + w, w]
+        bare = w.lstrip("#$([\"'")
+        if bare and bare != w:
+            variants += [" " + bare, bare]
+    pieces = {}
+    for v in variants:
+        ids = enc(v)
+        for tid, piece in zip(ids, TOK.convert_ids_to_tokens(ids)):
+            if piece and not piece.startswith("<"):
+                pieces[tid] = piece.replace("\u2581", " ")
+    with _piece_lock:
+        if len(_piece_cache) > 256:
+            _piece_cache.clear()
+        _piece_cache[text] = pieces
+    return pieces
+
+
+def span_read_canvas(sys_text, state_content, body_ids, free, allowed, seed, steps):
+    """One pinned read of a canvas whose body follows the scaffold, with the
+    positions in ``free`` left as noise. Returns per body position the
+    logprobs of the ``allowed`` ids, and the emitted ids."""
+    rng = random.Random(seed)
+    shown = [rng.randrange(VOCAB) if i in free else t for i, t in enumerate(body_ids)]
+    template = SCAFFOLD + shown
+    width = canvas_width(template)
+    if len(template) + 1 > width:
+        raise SchemaError(
+            f"a span blank of {len(body_ids)} rows does not fit the canvas"
+        )
+    canvas = template + [TURN_CLOSE]
+    canvas += [PAD] * (width - len(canvas))
+    want = sorted(allowed)
+    if len(want) > SPAN_ID_CAP:
+        raise SchemaError(
+            f"{len(want)} distinct token ids; a read allows {SPAN_ID_CAP}"
+        )
+    pinned = [p for p in range(width) if (p - len(SCAFFOLD)) not in free]
+    d = upstream_chat(
+        {
+            "model": ARGS.model,
+            "messages": [
+                {"role": "system", "content": sys_text},
+                {"role": "user", "content": state_content},
+            ],
+            "max_tokens": width,
+            "logprobs": True,
+            "top_logprobs": 1,
+            "logprob_token_ids": want,
+            "return_tokens_as_token_ids": True,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "vllm_xargs": {
+                "diffusion_seed_canvas": canvas,
+                "diffusion_canvas_length": width,
+                "diffusion_max_steps": steps,
+                "diffusion_read_only": True,
+                "diffusion_pinned": pinned,
+            },
+        }
+    )
+    content = d["choices"][0]["logprobs"]["content"]
+    rows, emitted = [], []
+    for c in content[len(SCAFFOLD) : len(SCAFFOLD) + len(body_ids)]:
+        rows.append(
+            {int(t["token"].split(":")[1]): t["logprob"] for t in c["top_logprobs"]}
+        )
+        emitted.append(int(c["token"].split(":")[1]))
+    return rows, emitted, width
+
+
+def span_decode(text, rows, pieces, none_id, max_slop=2, slop_cost=-1.5, min_start=0):
+    """The best contiguous substring under the blank's logprobs. Each token
+    scores as regret against the model's own top pick at its position, so a
+    long span pays only where it departs from what the model wanted to
+    write. Up to ``max_slop`` blank positions may be skipped at ``slop_cost``
+    each without advancing in the text, so an inserted token (a fix, a
+    closing quote) does not break the walk. Returns (score, start, end,
+    confidence, coverage); start is None for none. Confidence is the weakest
+    normalised probability along the span and its end; coverage is the mass
+    the allowed ids held there."""
+    n = len(rows)
+    L = len(text)
+    end_ids = {TURN_CLOSE, EOS, NL}
+    matches = [[] for _ in range(L + 1)]
+    starts = [[] for _ in range(L + 1)]
+    for tid, pc in pieces.items():
+        c = text.find(pc)
+        while c != -1:
+            matches[c].append((tid, len(pc)))
+            c = text.find(pc, c + 1)
+        if pc.startswith(" ") and len(pc) > 1:
+            q = pc[1:]
+            c = text.find(q)
+            while c != -1:
+                starts[c].append((tid, len(q)))
+                # one space from the model where the text has a run of whitespace
+                w = c
+                while w > 0 and text[w - 1].isspace():
+                    w -= 1
+                if c - w > 1:
+                    matches[w].append((tid, c - w + len(q)))
+                c = text.find(q, c + 1)
+    space_ids = [tid for tid, pc in pieces.items() if pc == " "]
+    z = [sum(math.exp(v) for v in r.values()) or 1e-9 for r in rows]
+    top = [max(r.values()) if r else SPAN_FLOOR for r in rows]
+    end_lp = [
+        max(r.get(e, SPAN_FLOOR) for e in end_ids) - top[k] for k, r in enumerate(rows)
+    ]
+    punct = {
+        tid
+        for tid, pc in pieces.items()
+        if pc.strip() and all(ch in SPAN_BOUNDARY for ch in pc.strip())
+    }
+    end_conf = [
+        sum(math.exp(r[t]) for t in r if t in end_ids or t in punct) / z[k]
+        for k, r in enumerate(rows)
+    ]
+    cov = [min(1.0, zk) for zk in z]
+    best = None
+    for a in range(min_start, L):
+        if text[a].isspace() or not (a == 0 or text[a - 1] in SPAN_BOUNDARY):
+            continue
+        dp = {(a, 0): (0.0, 1.0)}
+        for k in range(n - 1):
+            nxt = {}
+            for (c, used), (sc, mn) in dp.items():
+                opts = matches[c]
+                if k == 0:  # a value may open with a lone space token
+                    opts = opts + starts[c] + [(t, 0) for t in space_ids]
+                for tid, ln in opts:
+                    lp = rows[k].get(tid, SPAN_FLOOR)
+                    if lp <= SPAN_FLOOR:
+                        continue
+                    cand = (sc + lp - top[k], min(mn, math.exp(lp) / z[k]))
+                    key = (c + ln, used)
+                    if key not in nxt or cand[0] > nxt[key][0]:
+                        nxt[key] = cand
+                if used < max_slop and c > a:
+                    key = (c, used + 1)
+                    cand = (sc + slop_cost, mn)
+                    if key not in nxt or cand[0] > nxt[key][0]:
+                        nxt[key] = cand
+            dp = nxt
+            if not dp:
+                break
+            for (c, used), (sc, mn) in dp.items():
+                if c == a or not (c == L or text[c] in SPAN_BOUNDARY):
+                    continue
+                total = sc + end_lp[k + 1]
+                if best is None or total > best[0]:
+                    best = (
+                        total,
+                        a,
+                        c,
+                        min(mn, end_conf[k + 1]),
+                        sum(cov[: k + 2]) / (k + 2),
+                    )
+    none = rows[0].get(none_id, SPAN_FLOOR) - top[0] + (end_lp[1] if n > 1 else 0.0)
+    if best is None or none > best[0]:
+        return (
+            none,
+            None,
+            None,
+            math.exp(rows[0].get(none_id, SPAN_FLOOR)) / z[0],
+            cov[0],
+        )
+    return best
+
+
+def span_trim(text, a, b):
+    """Trailing sentence punctuation the model copied along ("No!" -> "No")."""
+    while b - a > 1 and text[b - 1] in ".,;:!?" and not text[b - 2].isdigit():
+        b -= 1
+    return b
+
+
+def span_windows(text, reserve=0):
+    """(start, end) windows whose token ids fit one read, split at sentence
+    ends and newlines with one sentence of overlap. The whole text when it
+    fits."""
+    budget = SPAN_ID_CAP - 4 - reserve
+    if len(span_pieces(text)) <= budget:
+        return [(0, len(text))]
+    units = [
+        (m.start(), m.end())
+        for m in re.finditer(r"[^.!?\n]*[.!?\n]+\s*|[^.!?\n]+$", text)
+        if text[m.start() : m.end()].strip()
+    ]
+    split = []
+    for s_, e in units:
+        if len(span_pieces(text[s_:e])) <= budget:
+            split.append((s_, e))
+            continue
+        cur = s_
+        for m in re.finditer(r"\S+\s*", text[s_:e]):
+            if (
+                len(span_pieces(text[cur : s_ + m.end()])) > budget
+                and s_ + m.start() > cur
+            ):
+                split.append((cur, s_ + m.start()))
+                cur = s_ + m.start()
+        split.append((cur, e))
+    windows, cur = [], []
+    for s_, e in split:
+        if cur and len(span_pieces(text[cur[0][0] : e])) > budget:
+            windows.append((cur[0][0], cur[-1][1]))
+            cur = [cur[-1]] if len(span_pieces(text[cur[-1][0] : e])) <= budget else []
+        cur.append((s_, e))
+    if cur:
+        windows.append((cur[0][0], cur[-1][1]))
+    return windows
+
+
+def span_context(schema):
+    ins = schema.get("instructions")
+    return ("\n\n" + str(ins).strip()) if ins else ""
+
+
+def span_choose(schema, q, state_content, candidates, seed):
+    """A one-step choice over candidate strings with the whole state in
+    view: the verify step when windows disagree. Returns (index, probs)."""
+    letters = [chr(ord("A") + i) for i in range(len(candidates))]
+    options = "\n".join(f"  {ltr}: {c}" for ltr, c in zip(letters, candidates))
+    sys_text = SPAN_CHOOSE_SYSTEM.format(
+        q=q["instructions"], context=span_context(schema), options=options
+    )
+    ids = [enc(" " + ltr)[0] for ltr in letters]
+    body = enc("answer:") + [PAD]
+    rows, _, _ = span_read_canvas(
+        sys_text,
+        state_content,
+        body,
+        {len(body) - 1},
+        set(ids) | {TURN_CLOSE, EOS, NL},
+        seed,
+        1,
+    )
+    dist = slot_distribution(rows[-1], ids)
+    probs = dict(zip(candidates, dist["probs"]))
+    return max(range(len(candidates)), key=lambda i: dist["probs"][i]), probs
+
+
+def read_span_window(schema, q, sys_text, state_content, text, window, seed):
+    """One span question in one window: up to SPAN_MAX_READS reads with
+    successive seeds until the answer clears SPAN_MIN_CONF. A rare bad read
+    places the end early and shows up as low confidence."""
+    wtext = text[window[0] : window[1]]
+    pieces = span_pieces(wtext)
+    none_id = enc(" none")[0]
+    allowed = set(pieces) | {TURN_CLOSE, EOS, NL, none_id}
+    head = enc("answer:")
+    region = max(
+        1, min(q["span"]["max_tokens"], CANVAS_LEN - len(SCAFFOLD) - len(head) - 1)
+    )
+    body = head + [PAD] * region
+    free = set(range(len(head), len(body)))
+    steps = max(SPAN_STEPS, schema["steps"])
+    best, reads, rows_used = None, 0, 0
+    for i in range(SPAN_MAX_READS):
+        rows, _, width = span_read_canvas(
+            sys_text, state_content, body, free, allowed, seed + i, steps
+        )
+        reads += 1
+        rows_used += width
+        _, a, b, conf, cov = span_decode(wtext, rows[len(head) :], pieces, none_id)
+        if a is None:
+            ans = {
+                "type": "span",
+                "found": False,
+                "text": None,
+                "start": None,
+                "end": None,
+            }
+        else:
+            b = span_trim(wtext, a, b)
+            ans = {
+                "type": "span",
+                "found": True,
+                "text": wtext[a:b],
+                "start": a + window[0],
+                "end": b + window[0],
+            }
+        ans["confidence"] = round(conf, 4)
+        ans["coverage"] = round(cov, 4)
+        if best is None or ans["confidence"] > best["confidence"]:
+            best = ans
+        if ans["confidence"] >= SPAN_MIN_CONF:
+            break
+    best["reads"] = reads
+    return best, rows_used
+
+
+def read_span(schema, q, state_content, seed):
+    """One span question: the whole text in the prompt, the read restricted
+    to each window's ids, windows in parallel, and one verify choice when
+    they disagree."""
+    text = span_source(state_content)
+    sys_text = SPAN_SYSTEM.format(q=q["instructions"], context=span_context(schema))
+    windows = span_windows(text)
+    with ThreadPoolExecutor(max_workers=min(8, len(windows))) as ex:
+        parts = list(
+            ex.map(
+                lambda w: read_span_window(
+                    schema, q, sys_text, state_content, text, w, seed
+                ),
+                windows,
+            )
+        )
+    rows = sum(r for _, r in parts)
+    found = [a for a, _ in parts if a["found"]]
+    if not found:
+        a = max((a for a, _ in parts), key=lambda a: a["confidence"] * a["coverage"])
+    else:
+        found.sort(key=lambda a: -a["confidence"] * a["coverage"])
+        distinct = []
+        for a in found:
+            if a["text"] not in [d["text"] for d in distinct]:
+                distinct.append(a)
+        a = distinct[0]
+        if len(distinct) > 1:
+            i, probs = span_choose(
+                schema, q, state_content, [d["text"] for d in distinct[:8]], seed
+            )
+            a = distinct[i]
+            a["resolved"] = probs
+            a["reads"] += 1
+    a["reads"] = sum(p["reads"] for p, _ in parts) + (1 if "resolved" in a else 0)
+    if len(windows) > 1:
+        a["windows"] = len(windows)
+    return a, rows
+
+
+def read_spans_window(schema, q, sys_text, state_content, text, window, seed):
+    """A list of spans in one window: one read writes the values one per
+    line, each line is decoded as a span whose start follows the previous
+    item, so repeated mentions map to successive occurrences."""
+    wtext = text[window[0] : window[1]]
+    pieces = span_pieces(wtext)
+    none_id = enc(" none")[0]
+    allowed = set(pieces) | {TURN_CLOSE, EOS, NL, none_id}
+    head = enc("answer:")
+    region = max(
+        1, min(q["span"]["max_tokens"], CANVAS_LEN - len(SCAFFOLD) - len(head) - 1)
+    )
+    body = head + [PAD] * region
+    free = set(range(len(head), len(body)))
+    steps = max(SPAN_STEPS, schema["steps"])
+    rows, emitted, width = span_read_canvas(
+        sys_text, state_content, body, free, allowed, seed, steps
+    )
+    region_rows, region_em = rows[len(head) :], emitted[len(head) :]
+    items, seg_start, min_start = [], 0, 0
+    for k, t in enumerate(region_em + [TURN_CLOSE]):
+        if t not in (TURN_CLOSE, EOS, NL) and t != PAD:
+            continue
+        # the model repeats an "answer:" label on later lines: its word is
+        # outside the allowed set, its colon may not be (the text can hold
+        # "02:14"), so skip unreadable tokens and a colon after them
+        if seg_start < k and region_em[seg_start] not in allowed:
+            while seg_start < k and region_em[seg_start] not in allowed:
+                seg_start += 1
+            if seg_start < k and pieces.get(region_em[seg_start], "").strip() == ":":
+                seg_start += 1
+        seg = region_rows[seg_start : k + 1]
+        if k > seg_start and seg:
+            _, a, b, conf, cov = span_decode(wtext, seg, pieces, none_id)
+            dup = False
+            if a is not None and a < min_start:
+                if wtext.find(wtext[a:b], min_start) != -1:
+                    _, a, b, conf, cov = span_decode(
+                        wtext, seg, pieces, none_id, min_start=min_start
+                    )
+                else:
+                    a, dup = None, True  # the model repeated a line it wrote
+            if a is not None:
+                b = span_trim(wtext, a, b)
+                items.append(
+                    {
+                        "text": wtext[a:b],
+                        "start": a + window[0],
+                        "end": b + window[0],
+                        "confidence": round(conf, 4),
+                        "coverage": round(cov, 4),
+                    }
+                )
+                min_start = b
+            elif not items and not dup:
+                break  # the first line is none
+        seg_start = k + 1
+        if t != NL or len(items) >= q["span"]["max_items"]:
+            break
+    return items, width
+
+
+def read_spans(schema, q, state_content, seed):
+    """Every span of a kind: windows and SPAN_PASSES seeds in parallel,
+    merged by offset, low-confidence lines dropped."""
+    text = span_source(state_content)
+    sys_text = SPAN_LIST_SYSTEM.format(
+        q=q["instructions"], context=span_context(schema)
+    )
+    windows = span_windows(text)
+    jobs = [(w, seed + p) for p in range(SPAN_PASSES) for w in windows]
+    with ThreadPoolExecutor(max_workers=min(8, len(jobs))) as ex:
+        parts = list(
+            ex.map(
+                lambda j: read_spans_window(
+                    schema, q, sys_text, state_content, text, j[0], j[1]
+                ),
+                jobs,
+            )
+        )
+    items = []
+    for part, _ in parts:
+        for it in part:
+            if it["confidence"] < SPAN_MIN_CONF:
+                continue
+            same = [
+                o for o in items if it["start"] < o["end"] and it["end"] > o["start"]
+            ]
+            if same:
+                if it["confidence"] > same[0]["confidence"]:
+                    same[0].update(it)
+                continue
+            items.append(it)
+    items.sort(key=lambda i: i["start"])
+    a = {"type": "spans", "found": bool(items), "items": items, "reads": len(jobs)}
+    if len(windows) > 1:
+        a["windows"] = len(windows)
+    return a, sum(r for _, r in parts)
+
+
+def decide_spans(schema, span_qs, state_content, seed):
+    """Every span question of a decision, in parallel."""
+    started = time.time()
+    if not span_source(state_content).strip():
+        raise SchemaError("a span question needs a text state to point into")
+
+    def run(iq):
+        i, q = iq
+        fn = read_spans if q["type"] == "spans" else read_span
+        return fn(schema, q, state_content, seed + 104729 * (i + 1))
+
+    with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL, len(span_qs))) as ex:
+        results = list(ex.map(run, enumerate(span_qs)))
+    answers = {q["id"]: a for q, (a, _) in zip(span_qs, results)}
+    diag = {
+        "steps": max(SPAN_STEPS, schema["steps"]),
+        "reads": sum(a["reads"] for a, _ in results),
+        "rows": sum(r for _, r in results),
+        "source": "state" if isinstance(state_content, str) else "text part",
+        "ms": (time.time() - started) * 1e3,
+    }
+    return answers, diag
 
 
 def decide_group(schema, sys_text, state_content, seed, prefix=None, lead=""):
@@ -1094,6 +1680,15 @@ def jev_schema(body):
                     "of levels"
                 )
             item["levels"] = crit
+        elif kind in ("span", "spans"):
+            if crit is not None and not isinstance(crit, dict):
+                raise SchemaError(
+                    f"question {qid!r}: {kind} criteria must be an object, "
+                    'e.g. {"max_tokens": 24}'
+                )
+            for key in ("max_tokens", "max_items"):
+                if crit and key in crit:
+                    item[key] = crit[key]
         else:
             raise SchemaError(f"question {qid!r}: unknown type {kind!r}")
         for key in ("depends_on", "ask_if", "alone"):
@@ -1166,6 +1761,8 @@ def jev_answer(q, a):
             "probabilities": a["probabilities"],
             "confidence": a["confidence"],
         }
+    if q["type"] in ("span", "spans"):
+        return a
     names = [c[0] for c in q["choices"]]
     probs = {str(i): a["probabilities"][n] for i, n in enumerate(names)}
     return {
@@ -1180,6 +1777,17 @@ def jev_answer(q, a):
 # ----------------------------------------------------------------------------
 # HTTP
 # ----------------------------------------------------------------------------
+
+
+def answer_brief(v):
+    """One word of an answer for the log line."""
+    if v is None:
+        return "skipped"
+    if "label" in v:
+        return v["label"]
+    if "items" in v:
+        return f"{len(v['items'])}spans"
+    return repr(v.get("text")) if v.get("found") else "none"
 
 
 def message_text(m):
@@ -1323,9 +1931,7 @@ class Handler(BaseHTTPRequestHandler):
             q["id"]: jev_answer(q, body["answers"][q["id"]])
             for q in schema["questions"]
         }
-        labels = " ".join(
-            f"{k}={v['label'] if v else 'skipped'}" for k, v in body["answers"].items()
-        )
+        labels = " ".join(f"{k}={answer_brief(v)}" for k, v in body["answers"].items())
         print(
             f"systemone: {labels} "
             f"reads={body['diagnostics']['timing']['reads']} "
@@ -1410,9 +2016,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(code, result)
         body, completion_tokens = result
         content = json.dumps(body, indent=2)
-        labels = " ".join(
-            f"{k}={v['label'] if v else 'skipped'}" for k, v in body["answers"].items()
-        )
+        labels = " ".join(f"{k}={answer_brief(v)}" for k, v in body["answers"].items())
         print(
             f"structured: {labels} "
             f"reads={body['diagnostics']['timing']['reads']} "
