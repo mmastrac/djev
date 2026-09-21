@@ -1,5 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Structured decisions in front of a vLLM DiffusionGemma server.
 
 POST /v1/systemone takes Jev's request body: {"model", "state", "questions"}.

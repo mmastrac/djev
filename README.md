@@ -70,9 +70,9 @@ generation time.
 
 ## Provenance
 
-This server is the example from vLLM PR
+This server is the example that ships with vLLM PR
 [#57250](https://github.com/vllm-project/vllm/pull/57250), which adds
 structured reads to DiffusionGemma (seeded canvas, pinned positions, a step
-cap, read-only requests and exact logprobs for chosen token ids). It runs in
-front of a vLLM built from that branch. The file keeps its vLLM license
-headers; the repository is Apache-2.0.
+cap, read-only requests and exact logprobs for chosen token ids). This
+repository is its home; the copy in the PR is a snapshot. It runs in front of
+a vLLM built from that branch.
