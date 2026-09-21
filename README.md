@@ -35,8 +35,9 @@ scheduling. The diffusion async scheduler is selected automatically; no
 canvases only.
 
 Question types: `noul` (yes/no), `choice` with `options`, `score` with
-ordered `levels`. Each label must be a single token in the answer template,
-which the server checks with the tokenizer when a request uses the schema.
+ordered `levels`, and `span` / `spans` (below). Each label must be a single
+token in the answer template, which the server checks with the tokenizer
+when a request uses the schema.
 
 `POST /v1/systemone` implements the Jev decision API. The body holds
 `state`, `questions` (a map of id to `type`, `instructions` and `criteria`)
@@ -59,6 +60,57 @@ curl -s localhost:8011/v1/systemone -H 'content-type: application/json' -d '{
   "state": {"ticket": "Everything is down and we have a demo at noon."},
   "questions": {"urgent": {"type": "noul", "instructions": "Does the customer need a reply within the hour?"}}}'
 ```
+
+## Span answers
+
+`span` answers with a piece of the state's text, as character offsets, and
+`spans` with every such piece. The model never writes the value: the read
+seeds the reply canvas with a label and a blank, pins everything but the
+blank, runs four denoise steps, and returns the logprobs of the text's own
+token ids at every position of the blank. The decode walks the text with
+those tokens' strings, so the answer is a substring by construction and
+cannot be a value the text does not contain. `start` and `end` index the
+state when it is a string, else its `"text"` field.
+
+```bash
+curl -s localhost:8011/v1/systemone -H 'content-type: application/json' -d '{
+  "model": "jev-latest",
+  "state": "Invoice #A-1042 from Northwind Traders. Total due: $1,234.56 by 2024-03-15.",
+  "questions": {
+    "invoice_id": {"type": "span", "instructions": "the invoice id"},
+    "amount": {"type": "span", "instructions": "the total amount due"},
+    "dates": {"type": "spans", "instructions": "date"}}}'
+```
+
+```json
+{"invoice_id": {"type": "span", "found": true, "text": "A-1042", "start": 9, "end": 15,
+                "confidence": 0.87, "coverage": 0.99, "reads": 1},
+ "amount":     {"type": "span", "found": true, "text": "$1,234.56", "start": 51, "end": 60, ...},
+ "dates":      {"type": "spans", "found": true, "items": [{"text": "2024-03-15", "start": 64, "end": 74, ...}]}}
+```
+
+`confidence` is the weakest normalised probability along the span and its
+end; a boundary the model was unsure of reads 0.1 to 0.3 against 0.5 and up
+on clean values. A read under 0.3 is repeated with the next seed, up to
+three times, and the most confident answer kept. `coverage` is the share of
+the model's probability mass that the text's tokens held along the span.
+Criteria: `max_tokens` (the blank, default 24 for `span` and 64 for
+`spans`) and `max_items`. Span questions run beside the label reads and
+cannot take part in `depends_on` or `ask_if`. Values that must be
+normalised (an ISO date from "Oct 1st") are not spans; extract the span and
+convert it in code.
+
+A text with more distinct tokens than one read can score (128) is split at
+sentences into windows with one sentence of overlap. The prompt always
+carries the whole text; only the read is restricted to each window, so the
+model is never answering from a fragment. Windows are read in parallel, the
+answer with the best confidence and coverage wins, and when windows
+disagree one further one-step choice over the candidates settles it. A
+`spans` question reads each window twice with different seeds and merges
+the lines by offset, since a line one read omits another usually writes.
+
+`tests/span_battery.py` runs 49 span fields, five lists, a mixed schema, the
+chat form and a four-window text against a live server.
 
 `"think": N` in the schema lets the model write up to N tokens in its
 thought channel before the read. The thought is an ordinary generation with
