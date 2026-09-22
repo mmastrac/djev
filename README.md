@@ -12,7 +12,9 @@ left as noise, one denoise step gives a distribution over each slot. These
 | `diffusion_max_steps` | `int` | denoise steps before the canvas is emitted |
 | `diffusion_read_only` | `bool` | emit the argmax canvas as soon as the cap is reached, end the request there, and return temperature-1 logprobs at every position |
 
-`structured_server.py` turns a question schema into those fields. It serves
+`structured_server.py` turns a question schema into those fields, or, with
+`--engine ar`, into next-token reads on any vLLM model that returns
+logprobs (below). It serves
 `/v1/chat/completions`: the system message is the schema, the user message
 is the state JSON, and the reply content is one distribution per question
 with a standard error over a few noise draws.
@@ -60,6 +62,47 @@ curl -s localhost:8011/v1/systemone -H 'content-type: application/json' -d '{
   "state": {"ticket": "Everything is down and we have a demo at noon."},
   "questions": {"urgent": {"type": "noul", "instructions": "Does the customer need a reply within the hour?"}}}'
 ```
+
+## Any vLLM model with logprobs
+
+`--engine ar` runs the same schemas on an ordinary autoregressive model
+served by vLLM, with no diffusion machinery. A label is one next-token read
+restricted to the question's label ids, taken in question order with the
+earlier answers prefilled, so a request with three questions is three reads
+of a few tokens each behind a cached prefix. A span is one restricted
+first-token read to fix the start, then every candidate end within twelve
+words scored teacher-forced through `prompt_logprobs`, the best total
+against a `none` candidate. A `spans` question asks for the first, second,
+third value until none. Reads are deterministic, so `samples` collapses to
+one; `think` and images are not available on this engine.
+
+Without `--tokenizer` the server tokenizes through the upstream's own
+`/tokenize` and `/detokenize`, so nothing has to be installed locally:
+
+```bash
+python structured_server.py --engine ar --upstream http://host:8000 --model glm53 --port 8011
+```
+
+Measured against GLM 5.3 (`tests/label_battery.py`, `tests/span_battery.py`),
+with DiffusionGemma NVFP4 on the diffusion engine beside it:
+
+| | GLM 5.3, `--engine ar` | DiffusionGemma, diffusion |
+| --- | --- | --- |
+| 22 label questions (noul, choice, score) | 21 | 20 |
+| 49 span fields, 11 texts | 48 | 49 |
+| 5 list questions | 5 | 5 |
+| a 1096-character text in 4 windows, 4 fields | 3, in 89 s | 4, in 4 s |
+| reads per label question | 1, about 0.27 s | one joint read for the schema, about 0.1 s |
+| reads per span field | 1 plus one per candidate end, about 1 s | 1 to 3, about 0.35 s |
+
+The AR span's one miss returned an email for an absent phone number at
+confidence 0.10, so the usual gate catches it. The long text is where the AR
+engine pays: every window scores its own candidate ends, so cost grows with
+windows times candidates.
+
+The diffusion engine's edge is cost: every label of a schema comes from one
+canvas read, and a span from one read of the blank. The AR engine's edge is
+that it needs nothing beyond stock vLLM.
 
 ## Span answers
 
