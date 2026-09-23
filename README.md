@@ -50,6 +50,12 @@ A question may declare `depends_on` (read in a later stage with those
 answers in its prompt), `ask_if` (asked only when a named question's answer
 is among the listed ones, otherwise null) and `alone` (a read of its own).
 
+`/v1/chat/completions` serves both kinds of request. A structured read is one
+whose first message is a system (or developer) message holding a JSON object with
+a `questions` key; anything else is ordinary chat and goes to vLLM unchanged,
+streaming included. Other `/v1/...` POSTs (completions, and so on) pass through
+the same way. `/v1/raw/chat/completions` still forces the pass-through.
+
 `GET /v1/models` passes through to vLLM, so the structured port lists the same
 served name. An OpenAI-compatible router that discovers models by probing that
 route can front this port and send `/v1/systemone` here by the body's `model`,

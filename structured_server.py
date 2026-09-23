@@ -1797,6 +1797,22 @@ def message_text(m):
     return c if isinstance(c, str) else ""
 
 
+def is_structured(req):
+    """True when a chat request is a structured read: its first message is a
+    system (or developer) message whose text is a JSON object with a
+    "questions" key. Anything else is ordinary chat for vLLM."""
+    msgs = req.get("messages") or []
+    if not msgs or not isinstance(msgs[0], dict):
+        return False
+    if msgs[0].get("role") not in ("system", "developer"):
+        return False
+    try:
+        value = json.loads(message_text(msgs[0]))
+    except ValueError:
+        return False
+    return isinstance(value, dict) and "questions" in value
+
+
 class Server(ThreadingHTTPServer):
     # The default backlog of 5 resets connections when a client opens as many
     # at once as the engine serves sequences.
@@ -1849,6 +1865,7 @@ class Handler(BaseHTTPRequestHandler):
         """-> (body, image parts): a JSON body, or multipart/form-data with the
         JSON in a part named request and each image as a file part, in order."""
         raw = self.rfile.read(int(self.headers.get("content-length", "0")))
+        self._raw = raw  # kept so a request that is not ours can be relayed as sent
         ctype = self.headers.get("content-type", "")
         if not ctype.lower().startswith("multipart/form-data"):
             return json.loads(raw), []
@@ -1904,29 +1921,52 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/systemone":
             return self._systemone(req, images)
         if self.path == "/v1/chat/completions":
-            return self._chat(req)
+            if is_structured(req):
+                return self._chat(req)
+            return self._relay(self.path, self._raw)
+        if self.path.startswith("/v1/"):
+            return self._relay(self.path, self._raw)
         return self._json(404, {"error": {"message": "unknown route"}})
 
     def _raw_chat(self):
         """Pass the body and status through to vLLM's chat completions."""
         raw = self.rfile.read(int(self.headers.get("content-length", "0")))
+        return self._relay("/v1/chat/completions", raw)
+
+    def _relay(self, path, raw):
+        """Send a request to vLLM as it arrived and return vLLM's status,
+        content type and body unchanged. The body is copied as it arrives, so a
+        streamed (SSE) response streams; this handler speaks HTTP/1.0, so a
+        response without a length ends when the connection closes."""
         req = urllib.request.Request(
-            ARGS.upstream.rstrip("/") + "/v1/chat/completions",
+            ARGS.upstream.rstrip("/") + path,
             data=raw,
             headers={
                 "content-type": self.headers.get("content-type", "application/json")
             },
         )
         try:
-            with urllib.request.urlopen(req, timeout=600) as r:
-                code, body = r.status, r.read()
+            r = urllib.request.urlopen(req, timeout=600)
         except urllib.error.HTTPError as e:
-            code, body = e.code, e.read()
-        self.send_response(code)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+            r = e
+        except OSError as e:
+            return self._json(
+                503, {"error": {"message": f"upstream unavailable: {e}"}}
+            )
+        with r:
+            self.send_response(r.code)
+            self.send_header(
+                "content-type", r.headers.get("content-type", "application/json")
+            )
+            if r.headers.get("content-length"):
+                self.send_header("content-length", r.headers["content-length"])
+            self.end_headers()
+            while True:
+                chunk = r.read1(65536) if hasattr(r, "read1") else r.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
 
     def _decide(self, schema, state, seed):
         """-> (status, body) with the error body already shaped."""
