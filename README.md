@@ -44,6 +44,9 @@ off by default:
 
 A stock vLLM rejects `seed` on a diffusion request, so `--engine-samples`
 fails there with a 400; `--constrained` is ignored.
+`--pages DIR` serves test pages: `GET /name` returns `DIR/name.html` and `GET /`
+returns `DIR/index.html`. It is off by default. The pages post to `/v1/systemone`
+like any other client.
 
 Question types: `noul` (yes/no), `choice` with `options`, `score` with
 ordered `levels`, and `span` / `spans` (below). Each label must be a single
