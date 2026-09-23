@@ -56,6 +56,16 @@ a `questions` key; anything else is ordinary chat and goes to vLLM unchanged,
 streaming included. Other `/v1/...` POSTs (completions, and so on) pass through
 the same way. `/v1/raw/chat/completions` still forces the pass-through.
 
+Tool calls pass through too, with one change. vLLM enforces `tool_choice:
+"required"` and a named function with structured outputs, which it does not
+support for diffusion models, so it would ignore both. For those two, the
+server pins the opening of a tool call on the canvas instead
+(`<|tool_call>call:`, plus the name and `{` for a named function) and sends
+`tool_choice: "auto"`, so the model can only fill in a call and vLLM's tool
+parser reads it. vLLM must run with `--enable-auto-tool-choice
+--tool-call-parser gemma4`; add `--exclude-tools-when-tool-choice-none` so that
+`"none"` gets a plain answer instead of a stripped call.
+
 `GET /v1/models` passes through to vLLM, so the structured port lists the same
 served name. An OpenAI-compatible router that discovers models by probing that
 route can front this port and send `/v1/systemone` here by the body's `model`,
