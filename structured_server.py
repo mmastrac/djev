@@ -76,6 +76,15 @@ the image in view and the server seeds it into the canvas ahead of the
 answer, so the canvas bounds it. The noise draws of a decision share one
 thought.
 
+Any vLLM model that returns logprobs can answer the same schemas with
+``--engine ar``: each label is one next-token read restricted to the label
+ids, in question order with earlier answers prefilled, and a span is one
+first-token read plus candidate spans scored teacher-forced with prompt
+logprobs. Without ``--tokenizer`` the server tokenizes through vLLM's own
+/tokenize and /detokenize, so no model files are needed locally:
+  python structured_server.py --engine ar --upstream http://host:8000 \
+      --model glm53 --port 8011
+
 Serve the model with a canvas that holds the answer template, for example:
   vllm serve google/diffusiongemma-26B-A4B-it \
       --diffusion-config '{"canvas_length": 64}' --max-logprobs 32 \
@@ -100,11 +109,14 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import pybase64 as base64
-from transformers import AutoTokenizer
+try:
+    import pybase64 as base64
+except ImportError:  # the stdlib module is slower but the same
+    import base64
 
 ARGS = None
 TOK = None
+ENGINE = "diffusion"  # or "ar": any vLLM model that returns logprobs
 API_KEY = os.environ.get(
     "API_KEY", ""
 )  # when set, POST routes need "Authorization: Bearer <key>"
@@ -377,12 +389,91 @@ def enc(text):
     return TOK.encode(text, add_special_tokens=False)
 
 
+def token_strs(text):
+    """(ids, piece strings) of ``text``, pieces with their leading-space and
+    newline markers turned back into characters."""
+    if hasattr(TOK, "encode_with_strs"):
+        ids, strs = TOK.encode_with_strs(text)
+    else:
+        ids = enc(text)
+        strs = TOK.convert_ids_to_tokens(ids)
+    out = []
+    for piece in strs:
+        if piece is None:
+            out.append(None)
+            continue
+        out.append(
+            piece.replace("\u2581", " ").replace("\u0120", " ").replace("\u010a", "\n")
+        )
+    return ids, out
+
+
+class RemoteTokenizer:
+    """The upstream vLLM server's tokenizer, through its /tokenize and
+    /detokenize routes. Enough for the reads: encode, decode, the chat
+    template, and token pieces."""
+
+    eos_token_id = None
+
+    def _post(self, path, body):
+        req = urllib.request.Request(
+            ARGS.upstream.rstrip("/") + path,
+            data=json.dumps(body).encode(),
+            headers={"content-type": "application/json"},
+        )
+        return json.load(urllib.request.urlopen(req, timeout=120))
+
+    def encode(self, text, add_special_tokens=False):
+        return self._post(
+            "/tokenize",
+            {
+                "model": ARGS.model,
+                "prompt": text,
+                "add_special_tokens": add_special_tokens,
+            },
+        )["tokens"]
+
+    def encode_with_strs(self, text):
+        r = self._post(
+            "/tokenize",
+            {
+                "model": ARGS.model,
+                "prompt": text,
+                "add_special_tokens": False,
+                "return_token_strs": True,
+            },
+        )
+        return r["tokens"], r["token_strs"]
+
+    def decode(self, ids, skip_special_tokens=False):
+        return self._post("/detokenize", {"model": ARGS.model, "tokens": list(ids)})[
+            "prompt"
+        ]
+
+    def apply_chat_template(
+        self, messages, tokenize=True, add_generation_prompt=True, enable_thinking=False
+    ):
+        return self._post(
+            "/tokenize",
+            {
+                "model": ARGS.model,
+                "messages": messages,
+                "add_generation_prompt": add_generation_prompt,
+                "chat_template_kwargs": {"enable_thinking": enable_thinking},
+            },
+        )["tokens"]
+
+
 def init_tokenizer(tok):
     global TOK, SCAFFOLD, THOUGHT_OPEN, THOUGHT_CLOSE, EOS, NL
     TOK = tok
     if tok.eos_token_id is not None:
         EOS = int(tok.eos_token_id)
     NL = enc("\n")[0]
+    if ENGINE == "ar":
+        # No canvas: the answer template follows the chat prompt directly.
+        SCAFFOLD, THOUGHT_OPEN, THOUGHT_CLOSE = [], [], []
+        return
     THOUGHT_OPEN = enc("<|channel>thought\n")
     THOUGHT_CLOSE = enc("<channel|>")
     SCAFFOLD = enc(SCAFFOLD_TEXT)
@@ -786,6 +877,8 @@ def decide(schema, state_content, seed):
     state for an image. A question whose ask_if condition failed is skipped
     and its answer is null."""
     started = time.time()
+    if ENGINE == "ar" and schema["think"]:
+        raise SchemaError("think: not available with --engine ar")
     qs = [
         q
         for q in schema["questions"]
@@ -815,7 +908,7 @@ def decide(schema, state_content, seed):
                 "reads": span_diag["reads"],
             },
             "questions": {},
-            "engine": "vllm",
+            "engine": "vllm-ar" if ENGINE == "ar" else "vllm",
         }
         return {"answers": span_answers, "diagnostics": diagnostics}, span_diag["rows"]
     levels = schedule(qs)
@@ -980,7 +1073,7 @@ def decide(schema, state_content, seed):
         )
         or None,
         "questions": diag_q,
-        "engine": "vllm",
+        "engine": "vllm-ar" if ENGINE == "ar" else "vllm",
     }
     total_rows = sum(rows for _, rows in parts) + extra_rows
     if span_future is not None:
@@ -1032,10 +1125,10 @@ def span_pieces(text):
             variants += [" " + bare, bare]
     pieces = {}
     for v in variants:
-        ids = enc(v)
-        for tid, piece in zip(ids, TOK.convert_ids_to_tokens(ids)):
+        ids, strs = token_strs(v)
+        for tid, piece in zip(ids, strs):
             if piece and not piece.startswith("<"):
-                pieces[tid] = piece.replace("\u2581", " ")
+                pieces[tid] = piece
     with _piece_lock:
         if len(_piece_cache) > 256:
             _piece_cache.clear()
@@ -1465,23 +1558,29 @@ def decide_spans(schema, span_qs, state_content, seed):
 
     def run(iq):
         i, q = iq
-        fn = read_spans if q["type"] == "spans" else read_span
+        if ENGINE == "ar":
+            fn = ar_read_spans if q["type"] == "spans" else ar_read_span
+        else:
+            fn = read_spans if q["type"] == "spans" else read_span
         return fn(schema, q, state_content, seed + 104729 * (i + 1))
 
     with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL, len(span_qs))) as ex:
         results = list(ex.map(run, enumerate(span_qs)))
     answers = {q["id"]: a for q, (a, _) in zip(span_qs, results)}
     diag = {
-        "steps": max(SPAN_STEPS, schema["steps"]),
+        "steps": 0 if ENGINE == "ar" else max(SPAN_STEPS, schema["steps"]),
         "reads": sum(a["reads"] for a, _ in results),
         "rows": sum(r for _, r in results),
         "source": "state" if isinstance(state_content, str) else "text part",
+        "engine": "vllm-ar" if ENGINE == "ar" else "vllm",
         "ms": (time.time() - started) * 1e3,
     }
     return answers, diag
 
 
 def decide_group(schema, sys_text, state_content, seed, prefix=None, lead=""):
+    if ENGINE == "ar":
+        return ar_decide_group(schema, sys_text, state_content, prefix, lead)
     started = time.time()
     thought = None
     head = SCAFFOLD if prefix is None else []
@@ -1619,9 +1718,379 @@ def decide_group(schema, sys_text, state_content, seed, prefix=None, lead=""):
             "thought": thought,
             "prompt_tokens": prompt_tokens,
             "questions": diag_q,
-            "engine": "vllm",
+            "engine": "vllm-ar" if ENGINE == "ar" else "vllm",
         },
     }, len(template) + 1 + (thought["tokens"] if thought else 0)
+
+
+# ----------------------------------------------------------------------------
+# Any vLLM model with logprobs
+# ----------------------------------------------------------------------------
+
+
+def ar_next(prompt_ids, want):
+    """Logprobs of the ``want`` ids at the next position, plus the model's own
+    top token. Temperature 0 so the read is deterministic."""
+    want = sorted(want)[:SPAN_ID_CAP]
+    d = upstream_completions(
+        {
+            "model": ARGS.model,
+            "prompt": prompt_ids,
+            "max_tokens": 1,
+            "logprobs": 1,
+            "logprob_token_ids": want,
+            "return_tokens_as_token_ids": True,
+            "temperature": 0,
+        }
+    )
+    row = d["choices"][0]["logprobs"]["top_logprobs"][0]
+    return {int(k.split(":")[1]): v for k, v in row.items()}, d.get("usage", {})
+
+
+_ar_end_ids = None
+
+
+def ar_end_ids():
+    """The ids that can end an assistant turn, learned from the chat template:
+    the tail the template writes after an assistant message, what the next
+    turn opens with, the tokenizer's eos and a newline. A candidate value is
+    scored followed by an end, and the end the template teaches is the one
+    the model expects."""
+    global _ar_end_ids
+    if _ar_end_ids is None:
+        base = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+        turn = [{"role": "assistant", "content": "hello"}]
+        a = TOK.apply_chat_template(
+            base + turn, tokenize=True, add_generation_prompt=False
+        )
+        b = TOK.apply_chat_template(
+            base + turn + [{"role": "user", "content": "next"}],
+            tokenize=True,
+            add_generation_prompt=False,
+        )
+        a = list(a["input_ids"] if hasattr(a, "keys") else a)
+        b = list(b["input_ids"] if hasattr(b, "keys") else b)
+        common = 0
+        while common < min(len(a), len(b)) and a[common] == b[common]:
+            common += 1
+        ends = {NL}
+        hello = enc("hello")
+        if hello and hello[-1] in a:
+            ends.update(a[a.index(hello[-1]) + 1 :][:2])
+        if common < len(b):
+            ends.add(b[common])
+        if EOS is not None:
+            ends.add(EOS)
+        _ar_end_ids = {int(t) for t in ends}
+    return _ar_end_ids
+
+
+def ar_score(prompt_ids, k, end=False):
+    """Teacher-forced logprob of each of the last ``k`` prompt tokens, with the
+    top-1 logprob at that position beside it. With ``end`` the last token is
+    an end marker and its logprob is the best over every end-of-turn id among
+    the position's top entries."""
+    d = upstream_completions(
+        {
+            "model": ARGS.model,
+            "prompt": prompt_ids,
+            "max_tokens": 1,
+            "prompt_logprobs": 8 if end else 1,
+            "temperature": 0,
+        }
+    )
+    entries = d["choices"][0]["prompt_logprobs"][-k:]
+    out = []
+    for i, entry in enumerate(entries):
+        tid = prompt_ids[len(prompt_ids) - k + i]
+        lp = entry.get(str(tid), {}).get("logprob", SPAN_FLOOR)
+        top = max(v["logprob"] for v in entry.values())
+        if end and i == len(entries) - 1:
+            for e in ar_end_ids():
+                lp = max(lp, entry.get(str(e), {}).get("logprob", SPAN_FLOOR))
+        out.append((lp, top))
+    return out
+
+
+def ar_decide_group(schema, sys_text, state_content, prefix=None, lead=""):
+    """The group's questions in order, one next-token read each: the prompt,
+    the answer template up to the question's slot with the earlier labels
+    filled in, and the logprobs of this question's label ids. Prefix caching
+    makes each read a few tokens of prefill."""
+    started = time.time()
+    if schema["think"]:
+        raise SchemaError("think: not available with --engine ar")
+    if not isinstance(state_content, str):
+        raise SchemaError("images: not available with --engine ar")
+    template, slots = template_for(schema, [], lead)
+    base = prefix if prefix is not None else chat_prompt_ids(sys_text, state_content)
+    chosen = list(template)
+    reads, prompt_tokens = [], None
+    for q, s in zip(schema["questions"], slots):
+        top, usage = ar_next(base + chosen[: s["pos"]], s["label_ids"])
+        prompt_tokens = prompt_tokens or usage.get("prompt_tokens")
+        dist = slot_distribution(top, s["label_ids"])
+        reads.append(dist)
+        chosen[s["pos"]] = s["label_ids"][
+            max(range(len(dist["probs"])), key=lambda i: dist["probs"][i])
+        ]
+    answers, diag_q = {}, {}
+    for q, s, r in zip(schema["questions"], slots, reads):
+        probs = r["probs"]
+        top = max(range(len(probs)), key=lambda i: probs[i])
+        a = {
+            "type": q["type"],
+            "label": q["labels"][top],
+            "confidence": probs[top],
+            "probabilities": {c[0]: p for c, p in zip(q["choices"], probs)},
+        }
+        if q["type"] == "noul":
+            a["noul"] = probs[0]
+        elif q["type"] == "choice":
+            a["choice"] = q["choices"][top][0]
+        else:
+            a["score"] = sum((i + 1) * p for i, p in enumerate(probs))
+            a["level"] = q["choices"][top][0]
+        answers[q["id"]] = a
+        diag_q[q["id"]] = {
+            "pos": s["pos"],
+            "entropy": [r["entropy"]],
+            "label_mass": r["label_mass"],
+            "argmax_is_label": r["argmax_is_label"],
+        }
+    tops = [
+        {
+            q["id"]: [
+                q["labels"][max(range(len(r["probs"])), key=lambda i: r["probs"][i])],
+                max(r["probs"]),
+                r["entropy"],
+            ]
+            for q, r in zip(schema["questions"], reads)
+        }
+    ]
+    return {
+        "answers": answers,
+        "diagnostics": {
+            "steps": 0,
+            "samples": {
+                "n": 1,
+                "tops": tops,
+                "policy": {"mode": "single", "why": "logprob reads are deterministic"},
+            },
+            "timing": {"total_ms": (time.time() - started) * 1e3, "reads": len(reads)},
+            "thought": None,
+            "prompt_tokens": prompt_tokens,
+            "questions": diag_q,
+            "engine": "vllm-ar",
+        },
+    }, len(template)
+
+
+def ar_start_ids(text):
+    """The ids a value in ``text`` can open with: each word's first token,
+    spaced and unspaced, and again without leading punctuation."""
+    out = set()
+    for w in set(text.split()):
+        out.add(enc(" " + w)[0])
+        out.add(enc(w)[0])
+        bare = w.lstrip("#$([\"'")
+        if bare and bare != w:
+            out.add(enc(" " + bare)[0])
+            out.add(enc(bare)[0])
+    return out
+
+
+def ar_first_pick(prompt_ids, starts, none_id):
+    """The model's first answer token, restricted to the text's starts. A lone
+    space is followed by a second read, since digits never merge with the
+    space before them."""
+    space = enc(" ")[0]
+    cand = set(starts) | {none_id, space}
+    top, usage = ar_next(prompt_ids, cand)
+    first = max(cand, key=lambda t: top.get(t, SPAN_FLOOR))
+    lead = []
+    if first == space:
+        lead = [space]
+        cand.discard(space)
+        top, _ = ar_next(prompt_ids + lead, cand)
+        first = max(cand, key=lambda t: top.get(t, SPAN_FLOOR))
+    z = sum(math.exp(v) for v in top.values()) or 1e-9
+    return first, lead, math.exp(top.get(first, SPAN_FLOOR)) / z, usage
+
+
+def ar_read_span(schema, q, state_content, seed=0, question=None):
+    """A span on an autoregressive model: one restricted first-token read fixes
+    the start; every candidate end within twelve words is scored teacher-forced
+    and the best total logprob wins, against a "none" candidate. AR likelihood
+    rewards fluent prose, so the start is never left to the scoring. Text past
+    the read's id limit is split into windows; the prompt carries the whole
+    text and the best-scoring window's span wins."""
+    if not isinstance(state_content, str):
+        raise SchemaError("images: not available with --engine ar")
+    started = time.time()
+    text = span_source(state_content)
+    question = question or q["instructions"]
+    sys_text = SPAN_SYSTEM.format(q=question, context=span_context(schema))
+    base = chat_prompt_ids(sys_text, state_content) + enc("answer:")
+    none_id = enc(" none")[0]
+    nl = NL
+    words = [(m.start(), m.end()) for m in re.finditer(r"\S+", text)]
+    reads = [0]
+
+    def window(lo, hi):
+        """(best total logprob, answer) for the text in [lo, hi)"""
+        starts = ar_start_ids(text[lo:hi])
+        first, lead, first_conf, _ = ar_first_pick(base, starts, none_id)
+        reads[0] += 1 + bool(lead)
+        none = {
+            "type": "span",
+            "found": False,
+            "text": None,
+            "start": None,
+            "end": None,
+            "confidence": round(first_conf, 4),
+            "coverage": 1.0,
+        }
+        if first == none_id:
+            return SPAN_FLOOR, none
+        first_str = TOK.decode([first]).strip()
+        cands = set()
+        for m in re.finditer(re.escape(first_str), text) if first_str else []:
+            a = m.start()
+            if not lo <= a < hi or (a and text[a - 1] not in SPAN_BOUNDARY):
+                continue
+            wi = next((i for i, (ws, we) in enumerate(words) if ws <= a < we), None)
+            if wi is None:
+                continue
+            for j in range(wi, min(len(words), wi + 12)):
+                b = min(words[j][1], hi)
+                cands.add((a, b))
+                while b - 1 > a and text[b - 1] in ".,;:)]!?":
+                    b -= 1
+                    cands.add((a, b))
+        if not cands:
+            return SPAN_FLOOR, dict(none, confidence=0.0)
+
+        def score(ab):
+            ids = enc(" " + text[ab[0] : ab[1]])
+            return ab, ar_score(base + ids + [nl], len(ids) + 1, end=True)
+
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            scored = list(ex.map(score, sorted(cands)))
+        none_rows = ar_score(base + [none_id, nl], 2, end=True)
+        reads[0] += len(scored) + 1
+        best_ab, best_rows, best_total = None, none_rows, sum(lp for lp, _ in none_rows)
+        for ab, rows in scored:
+            total = sum(lp for lp, _ in rows)
+            if total > best_total:
+                best_ab, best_rows, best_total = ab, rows, total
+        if best_ab is None:
+            return best_total, dict(
+                none, confidence=round(min(math.exp(lp) for lp, _ in none_rows), 4)
+            )
+        a, b = best_ab
+        b = span_trim(text, a, b)
+        conf = min(min(math.exp(lp) for lp, _ in best_rows), first_conf)
+        return best_total, {
+            "type": "span",
+            "found": True,
+            "text": text[a:b],
+            "start": a,
+            "end": b,
+            "confidence": round(conf, 4),
+            "coverage": 1.0,
+        }
+
+    windows = span_windows(text)
+    with ThreadPoolExecutor(max_workers=min(4, len(windows))) as ex:
+        results = list(ex.map(lambda w: window(*w), windows))
+    found = [(t, a) for t, a in results if a["found"]]
+    if found:
+        _, answer = max(found, key=lambda ta: ta[0])
+    else:
+        answer = max((a for _, a in results), key=lambda a: a["confidence"])
+    answer["reads"] = reads[0]
+    if len(windows) > 1:
+        answer["windows"] = len(windows)
+    answer["ms"] = (time.time() - started) * 1e3
+    return answer, len(base)
+
+
+def ar_read_spans(schema, q, state_content, seed=0):
+    """Every span of a kind on an autoregressive model: the model writes the
+    list, one value per line, and each line is grounded by exact match in the
+    text at or after the previous item, so repeated mentions map to successive
+    occurrences. A line the text does not contain is dropped. Confidence is the
+    weakest token probability of the line as written."""
+    if not isinstance(state_content, str):
+        raise SchemaError("images: not available with --engine ar")
+    text = span_source(state_content)
+    sys_text = SPAN_LIST_SYSTEM.format(
+        q=q["instructions"], context=span_context(schema)
+    )
+    base = chat_prompt_ids(sys_text, state_content) + enc("answer:")
+    d = upstream_completions(
+        {
+            "model": ARGS.model,
+            "prompt": base,
+            "max_tokens": 12 * q["span"]["max_items"] + 16,
+            "logprobs": 1,
+            "return_tokens_as_token_ids": True,
+            "temperature": 0,
+        }
+    )
+    lp = d["choices"][0]["logprobs"]
+    ids = [int(t.split(":")[1]) for t in lp["tokens"]]
+    probs = [math.exp(v) if v is not None else 0.0 for v in lp["token_logprobs"]]
+    lines, cur, cur_probs = [], [], []
+    ends = ar_end_ids() - {NL}
+    for tid, pr in zip(ids, probs):
+        if tid in ends:
+            break  # the end-of-turn marker, which would glue onto the last line
+        piece = TOK.decode([tid])
+        if "\n" in piece:
+            head, _, rest = piece.partition("\n")
+            cur.append(head)
+            cur_probs.append(pr)
+            lines.append(("".join(cur), cur_probs))
+            cur, cur_probs = ([rest] if rest else []), ([pr] if rest else [])
+            continue
+        cur.append(piece)
+        cur_probs.append(pr)
+    if cur:
+        lines.append(("".join(cur), cur_probs))
+    items, min_start = [], 0
+    for raw, pr in lines:
+        value = raw.strip()
+        if ":" in value and value.split(":", 1)[0].strip().replace("_", "").isalnum():
+            value = value.split(":", 1)[1].strip()  # an "answer: value" label
+        value = value.rstrip(".,;")
+        if not value or value.lower() in ("none", "null"):
+            break
+        a = text.find(value, min_start)
+        if a == -1:
+            a = text.find(value)  # out of order: take it where it is
+        if a == -1:
+            continue
+        b = a + len(value)
+        if any(a < o["end"] and b > o["start"] for o in items):
+            continue
+        items.append(
+            {
+                "text": text[a:b],
+                "start": a,
+                "end": b,
+                "confidence": round(min(pr) if pr else 0.0, 4),
+                "coverage": 1.0,
+            }
+        )
+        min_start = max(min_start, b)
+        if len(items) >= q["span"]["max_items"]:
+            break
+    items.sort(key=lambda i: i["start"])
+    return {"type": "spans", "found": bool(items), "items": items, "reads": 1}, len(
+        base
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -2086,11 +2555,21 @@ def serve_tls(host, port, cert_dir):
 
 
 def main():
-    global ARGS, CANVAS_LEN, CANVAS_STEP
+    global ARGS, CANVAS_LEN, CANVAS_STEP, ENGINE
     p = argparse.ArgumentParser()
     p.add_argument("--upstream", default="http://127.0.0.1:8010")
     p.add_argument("--model", default="dgemma")
-    p.add_argument("--tokenizer", default="/models/dgemma", help="HF id or local path")
+    p.add_argument(
+        "--tokenizer",
+        default=None,
+        help="HF id or local path; omitted, the upstream's /tokenize is used",
+    )
+    p.add_argument(
+        "--engine",
+        choices=("diffusion", "ar"),
+        default="diffusion",
+        help="diffusion: DiffusionGemma canvas reads; ar: any vLLM model with logprobs",
+    )
     p.add_argument("--canvas", type=int, default=64, help="the served canvas length")
     p.add_argument(
         "--canvas-step",
@@ -2109,9 +2588,16 @@ def main():
         help="directory for the self-signed certificate",
     )
     ARGS = p.parse_args()
-    CANVAS_LEN = ARGS.canvas
+    ENGINE = ARGS.engine
+    # An autoregressive read has no canvas; the template check just needs a bound.
+    CANVAS_LEN = ARGS.canvas if ENGINE == "diffusion" else 4096
     CANVAS_STEP = ARGS.canvas_step
-    init_tokenizer(AutoTokenizer.from_pretrained(ARGS.tokenizer))
+    if ARGS.tokenizer:
+        from transformers import AutoTokenizer
+
+        init_tokenizer(AutoTokenizer.from_pretrained(ARGS.tokenizer))
+    else:
+        init_tokenizer(RemoteTokenizer())
     if ARGS.tls_port:
         serve_tls(ARGS.host, ARGS.tls_port, ARGS.cert_dir)
         print(
@@ -2120,7 +2606,7 @@ def main():
         )
     print(
         f"structured server on {ARGS.host}:{ARGS.port} -> {ARGS.upstream} "
-        f"(canvas {CANVAS_LEN})",
+        + (f"(canvas {CANVAS_LEN})" if ENGINE == "diffusion" else "(engine ar)"),
         flush=True,
     )
     ThreadingHTTPServer((ARGS.host, ARGS.port), Handler).serve_forever()
