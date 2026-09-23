@@ -34,6 +34,10 @@ scheduling. The diffusion async scheduler is selected automatically; no
 `--scheduler-cls` argument is needed. Synchronous execution supports full-width
 canvases only.
 
+`--pages DIR` serves test pages: `GET /name` returns `DIR/name.html` and `GET /`
+returns `DIR/index.html`. It is off by default. The pages post to `/v1/systemone`
+like any other client.
+
 Question types: `noul` (yes/no), `choice` with `options`, `score` with
 ordered `levels`, and `span` / `spans` (below). Each label must be a single
 token in the answer template, which the server checks with the tokenizer

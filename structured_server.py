@@ -1856,7 +1856,24 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"status": "ok"})
         if self.path == "/v1/models":
             return self._models()
+        if ARGS.pages:
+            return self._page()
         return self._json(404, {"error": {"message": "unknown route"}})
+
+    def _page(self):
+        """With --pages DIR, GET /name serves DIR/name.html and / serves
+        DIR/index.html, for test pages that post to /v1/systemone."""
+        name = self.path.split("?", 1)[0].strip("/") or "index"
+        path = os.path.join(ARGS.pages, name + ".html")
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", name) or not os.path.isfile(path):
+            return self._json(404, {"error": {"message": "unknown route"}})
+        with open(path, "rb") as f:
+            body = f.read()
+        self.send_response(200)
+        self.send_header("content-type", "text/html; charset=utf-8")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _models(self):
         """Pass GET /v1/models through to vLLM, so this port lists the same
@@ -2193,6 +2210,12 @@ def main():
     p.add_argument("--port", type=int, default=8011)
     p.add_argument(
         "--tls-port", type=int, default=0, help="also listen with HTTPS here (0 = off)"
+    )
+    p.add_argument(
+        "--pages",
+        default="",
+        help="serve DIR/name.html at GET /name and DIR/index.html at / "
+        "(off when empty)",
     )
     p.add_argument(
         "--cert-dir",
