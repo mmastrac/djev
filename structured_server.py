@@ -1003,10 +1003,27 @@ def decide(schema, state_content, seed):
 # ----------------------------------------------------------------------------
 
 
-def span_source(state_content):
-    """The text a span's offsets refer to: the state when it is a string,
-    else the text part of an image state. A JSON state is grounded as the
-    JSON the model reads."""
+def span_text_of(state):
+    """The text a span's offsets index for a state as the client sent it: the
+    state itself when it is a string, its "text" field when it is an object
+    holding one as a string, else None (spans then ground in the rendered
+    state, see span_source)."""
+    if isinstance(state, str):
+        return state
+    if isinstance(state, dict) and isinstance(state.get("text"), str):
+        return state["text"]
+    return None
+
+
+def span_source(state_content, schema=None):
+    """The text a span is grounded in and its offsets refer to. The request's
+    span_text when it has one (a string state, or an object state's "text"
+    field); else the state as the model reads it: the message when it is a
+    string, the text part of an image state. The model reads an object state
+    as JSON, so grounding in that JSON would put offsets into the JSON and
+    make any escaped character (a newline, a quote) impossible to copy."""
+    if schema is not None and schema.get("span_text") is not None:
+        return schema["span_text"]
     if isinstance(state_content, str):
         return state_content
     return next((p["text"] for p in state_content if p.get("type") == "text"), "")
@@ -1321,7 +1338,7 @@ def read_span(schema, q, state_content, seed):
     """One span question: the whole text in the prompt, the read restricted
     to each window's ids, windows in parallel, and one verify choice when
     they disagree."""
-    text = span_source(state_content)
+    text = span_source(state_content, schema)
     sys_text = SPAN_SYSTEM.format(q=q["instructions"], context=span_context(schema))
     windows = span_windows(text)
     with ThreadPoolExecutor(max_workers=min(8, len(windows))) as ex:
@@ -1422,7 +1439,7 @@ def read_spans_window(schema, q, sys_text, state_content, text, window, seed):
 def read_spans(schema, q, state_content, seed):
     """Every span of a kind: windows and SPAN_PASSES seeds in parallel,
     merged by offset, low-confidence lines dropped."""
-    text = span_source(state_content)
+    text = span_source(state_content, schema)
     sys_text = SPAN_LIST_SYSTEM.format(
         q=q["instructions"], context=span_context(schema)
     )
@@ -1460,7 +1477,7 @@ def read_spans(schema, q, state_content, seed):
 def decide_spans(schema, span_qs, state_content, seed):
     """Every span question of a decision, in parallel."""
     started = time.time()
-    if not span_source(state_content).strip():
+    if not span_source(state_content, schema).strip():
         raise SchemaError("a span question needs a text state to point into")
 
     def run(iq):
@@ -1743,7 +1760,9 @@ def jev_state(body, image_parts=()):
     state = body.get("state")
     if state is None:
         raise SchemaError("state: required")
-    text = state if isinstance(state, str) else json.dumps(state)
+    # ensure_ascii=False: the model reads "°" as itself, not as \u00b0, so a
+    # span can copy it.
+    text = state if isinstance(state, str) else json.dumps(state, ensure_ascii=False)
     if not image_parts:
         return text
     return list(image_parts) + [{"type": "text", "text": text}]
@@ -1990,6 +2009,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             schema = jev_schema(req)
             state = jev_state(req, images + jev_images(req.get("images")))
+            schema["span_text"] = span_text_of(req.get("state"))
         except SchemaError as e:
             return self._json(
                 422, {"error": {"message": str(e), "type": "validation_error"}}
@@ -2061,7 +2081,7 @@ class Handler(BaseHTTPRequestHandler):
                 state = content
             else:
                 state = message_text(msgs[1]).strip()
-                json.loads(state)
+                schema["span_text"] = span_text_of(json.loads(state))
         except SchemaError as e:
             return self._json(
                 400, {"error": {"message": str(e), "type": "invalid_request_error"}}

@@ -80,8 +80,11 @@ seeds the reply canvas with a label and a blank, pins everything but the
 blank, runs four denoise steps, and returns the logprobs of the text's own
 token ids at every position of the blank. The decode walks the text with
 those tokens' strings, so the answer is a substring by construction and
-cannot be a value the text does not contain. `start` and `end` index the
-state when it is a string, else its `"text"` field.
+cannot be a value the text does not contain. `start` and `end` index the state when it is a string, else its `"text"`
+field when that is a string. The model still reads the whole object, so its
+other fields are context. An object with no string `"text"` field is
+grounded in the JSON the model reads, non-ASCII characters included as
+themselves.
 
 ```bash
 curl -s localhost:8011/v1/systemone -H 'content-type: application/json' -d '{
