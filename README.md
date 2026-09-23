@@ -60,9 +60,12 @@ Tool calls pass through too, with one change. vLLM enforces `tool_choice:
 "required"` and a named function with structured outputs, which it does not
 support for diffusion models, so it would ignore both. For those two, the
 server pins the opening of a tool call on the canvas instead
-(`<|tool_call>call:`, plus the name and `{` for a named function) and sends
+(`<|tool_call>call:` plus the name and `{`) and sends
 `tool_choice: "auto"`, so the model can only fill in a call and vLLM's tool
-parser reads it. vLLM must run with `--enable-auto-tool-choice
+parser reads it. For `"required"` the name comes from a one-step `choice` read
+over the offered functions' names and descriptions (or is the only one offered);
+pinning only the opening let the model invent a name when no tool fit. vLLM must
+run with `--enable-auto-tool-choice
 --tool-call-parser gemma4`; add `--exclude-tools-when-tool-choice-none` so that
 `"none"` gets a plain answer instead of a stripped call.
 
