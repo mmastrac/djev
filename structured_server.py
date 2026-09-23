@@ -1797,6 +1797,13 @@ def message_text(m):
     return c if isinstance(c, str) else ""
 
 
+class Server(ThreadingHTTPServer):
+    # The default backlog of 5 resets connections when a client opens as many
+    # at once as the engine serves sequences.
+    request_queue_size = 256
+    daemon_threads = True
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
@@ -1812,7 +1819,31 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             return self._json(200, {"status": "ok"})
+        if self.path == "/v1/models":
+            return self._models()
         return self._json(404, {"error": {"message": "unknown route"}})
+
+    def _models(self):
+        """Pass GET /v1/models through to vLLM, so this port lists the same
+        served name as the upstream. An OpenAI router that discovers models by
+        probing this route can then send /v1/systemone here by the body's
+        "model"."""
+        try:
+            with urllib.request.urlopen(
+                ARGS.upstream.rstrip("/") + "/v1/models", timeout=10
+            ) as r:
+                code, body = r.status, r.read()
+        except urllib.error.HTTPError as e:
+            code, body = e.code, e.read()
+        except OSError as e:
+            return self._json(
+                503, {"error": {"message": f"upstream unavailable: {e}"}}
+            )
+        self.send_response(code)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _read_request(self):
         """-> (body, image parts): a JSON body, or multipart/form-data with the
@@ -2079,7 +2110,7 @@ def serve_tls(host, port, cert_dir):
     cert, key = self_signed(cert_dir)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(cert, key)
-    srv = ThreadingHTTPServer((host, port), Handler)
+    srv = Server((host, port), Handler)
     srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
@@ -2123,7 +2154,7 @@ def main():
         f"(canvas {CANVAS_LEN})",
         flush=True,
     )
-    ThreadingHTTPServer((ARGS.host, ARGS.port), Handler).serve_forever()
+    Server((ARGS.host, ARGS.port), Handler).serve_forever()
 
 
 if __name__ == "__main__":
