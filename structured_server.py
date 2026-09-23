@@ -1873,6 +1873,91 @@ def message_text(m):
     return c if isinstance(c, str) else ""
 
 
+TOOL_CALL_OPEN = "<|tool_call>call:"  # how the chat template opens a call
+
+
+def pick_tool(req, fns):
+    """For tool_choice "required": which offered function fits the
+    conversation, by one choice read over the functions' names and
+    descriptions. Pinning only the call's opening lets the model write any
+    name, and with no fitting tool it writes nonsense ("get_", or the answer
+    itself) or no call at all."""
+    convo = "\n".join(
+        f"{m.get('role')}: {message_text(m)}"
+        for m in req.get("messages") or []
+        if isinstance(m, dict) and message_text(m)
+    )
+    schema = parse_schema(
+        {
+            "questions": [
+                {
+                    "id": "tool",
+                    "type": "choice",
+                    "instructions": "Which function should be called next in this conversation?",
+                    "options": [
+                        {"name": f["name"], "description": f.get("description")}
+                        for f in fns
+                    ],
+                }
+            ]
+        }
+    )
+    body, _ = decide(schema, convo, 42)
+    return body["answers"]["tool"]["choice"]
+
+
+def pin_tool_choice(req):
+    """The request to send vLLM in place of an ordinary chat whose tool_choice
+    is "required" or a named function, or None when nothing needs changing.
+
+    vLLM enforces those two choices with structured outputs, which it does not
+    support for diffusion models: the choice is ignored and the model calls
+    whatever it likes. A diffusion canvas can be seeded and pinned instead. This
+    pins the empty thought block and the opening of a tool call, plus the
+    function's name and brace when one is named, so the model can only fill in
+    a call, and sends tool_choice "auto" so vLLM's tool parser reads the
+    result. For "required" the name is pinned too: the only one offered, or
+    the one a choice read picks (pick_tool). A request that seeds its own canvas is
+    left alone, as is an unknown function name, which vLLM reports."""
+    tools = req.get("tools") or []
+    choice = req.get("tool_choice")
+    xargs = req.get("vllm_xargs") or {}
+    if not tools or "diffusion_seed_canvas" in xargs:
+        return None
+    if choice == "required":
+        fns = [t.get("function") or {} for t in tools]
+        names = [f.get("name") for f in fns if f.get("name")]
+        if len(names) == 1:
+            name = names[0]
+        elif 1 < len(names) <= 26:
+            name = pick_tool(req, [f for f in fns if f.get("name")])
+        else:
+            name = None
+        head = TOOL_CALL_OPEN + (name + "{" if name else "")
+    elif isinstance(choice, dict) and choice.get("type") == "function":
+        name = (choice.get("function") or {}).get("name")
+        offered = {(t.get("function") or {}).get("name") for t in tools}
+        if not name or name not in offered:
+            return None
+        head = TOOL_CALL_OPEN + name + "{"
+    else:
+        return None
+    pinned = SCAFFOLD + enc(head)
+    width = CANVAS_LEN
+    if len(pinned) >= width:
+        return None
+    rng = random.Random(len(pinned))
+    canvas = pinned + [rng.randrange(VOCAB) for _ in range(width - len(pinned))]
+    out = dict(req, tool_choice="auto")
+    out["vllm_xargs"] = dict(
+        xargs,
+        diffusion_seed_canvas=canvas,
+        diffusion_canvas_length=width,
+        diffusion_pinned=list(range(len(pinned))),
+    )
+    return out
+
+
 def is_structured(req):
     """True when a chat request is a structured read: its first message is a
     system (or developer) message whose text is a JSON object with a
@@ -2016,7 +2101,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/v1/chat/completions":
             if is_structured(req):
                 return self._chat(req)
-            return self._relay(self.path, self._raw)
+            pinned = pin_tool_choice(req)
+            raw = json.dumps(pinned).encode() if pinned else self._raw
+            return self._relay(self.path, raw)
         if self.path.startswith("/v1/"):
             return self._relay(self.path, self._raw)
         return self._json(404, {"error": {"message": "unknown route"}})
