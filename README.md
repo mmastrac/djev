@@ -50,6 +50,11 @@ A question may declare `depends_on` (read in a later stage with those
 answers in its prompt), `ask_if` (asked only when a named question's answer
 is among the listed ones, otherwise null) and `alone` (a read of its own).
 
+`GET /v1/models` passes through to vLLM, so the structured port lists the same
+served name. An OpenAI-compatible router that discovers models by probing that
+route can front this port and send `/v1/systemone` here by the body's `model`,
+which must then be the served name (`dgemma`) rather than an arbitrary label.
+
 Images attach as `multipart/form-data`, with the JSON in a part named
 `request` and each image as a file part, or as an `images` array of data
 URLs.
