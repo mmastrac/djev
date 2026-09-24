@@ -34,6 +34,10 @@ scheduling. The diffusion async scheduler is selected automatically; no
 `--scheduler-cls` argument is needed. Synchronous execution supports full-width
 canvases only.
 
+`--pages DIR` serves test pages: `GET /name` returns `DIR/name.html` and `GET /`
+returns `DIR/index.html`. It is off by default. The pages post to `/v1/systemone`
+like any other client.
+
 Two flags use engine changes that are still open against vLLM, so both are
 off by default:
 
