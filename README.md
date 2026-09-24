@@ -34,6 +34,17 @@ scheduling. The diffusion async scheduler is selected automatically; no
 `--scheduler-cls` argument is needed. Synchronous execution supports full-width
 canvases only.
 
+Two flags use engine changes that are still open against vLLM, so both are
+off by default:
+
+| flag | engine change | effect |
+|---|---|---|
+| `--constrained` | [vllm#58216](https://github.com/vllm-project/vllm/pull/58216), `diffusion_constrained` | reads run the unembedding, sampler and self-conditioning over the labels only: the same argmax for about a quarter less GPU time. Logprobs are normalized over the labels, so `label_mass` is always 1 |
+| `--engine-samples` | [vllm#58438](https://github.com/vllm-project/vllm/pull/58438), `diffusion_samples` | a fixed `samples: N` goes to vLLM as one request that fans out into N noise draws, instead of N requests. `--max-samples` caps N and must fit the engine's `diffusion_config.max_samples` |
+
+A stock vLLM rejects `seed` on a diffusion request, so `--engine-samples`
+fails there with a 400; `--constrained` is ignored.
+
 Question types: `noul` (yes/no), `choice` with `options`, `score` with
 ordered `levels`, and `span` / `spans` (below). Each label must be a single
 token in the answer template, which the server checks with the tokenizer
