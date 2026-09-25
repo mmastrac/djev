@@ -310,6 +310,10 @@ def parse_schema(value):
     think = value.get("think", 0)
     if isinstance(think, bool) or not isinstance(think, int) or not 0 <= think <= 4096:
         raise SchemaError("schema: think must be a thought budget in tokens, 0 to 4096")
+    labeled = [q for q in qs if not q["span"]]
+    fmt = "lines" if len(labeled) <= 10 else "indexed"
+    if fmt == "indexed" and not all(fits_indexed(q) for q in labeled):
+        fmt = "lines"  # an id ran into its label; "id: label" keeps them apart
     return {
         "questions": qs,
         "instructions": value.get("instructions"),
@@ -320,8 +324,26 @@ def parse_schema(value):
         "chunk_rows": chunk_rows,
         "chunk_prompt": chunk_prompt,
         "sequential": sequential,
-        "format": "lines" if len([q for q in qs if not q["span"]]) <= 10 else "indexed",
+        "format": fmt,
     }
+
+
+_indexed_fit_cache = {}
+
+
+def fits_indexed(q):
+    """Whether each of the question's labels stays one token when written
+    straight after its id, as "indexed" does ("toxicno" merges, "q0no" not)."""
+    key = (q["id"], tuple(q["labels"]))
+    if key not in _indexed_fit_cache:
+        if len(_indexed_fit_cache) > 4096:
+            _indexed_fit_cache.clear()
+        try:
+            resolve_template([q], [], FORMATS["indexed"][0], "indexed")
+            _indexed_fit_cache[key] = True
+        except SchemaError:
+            _indexed_fit_cache[key] = False
+    return _indexed_fit_cache[key]
 
 
 # Answer template shape: (join between questions, what precedes the label,
